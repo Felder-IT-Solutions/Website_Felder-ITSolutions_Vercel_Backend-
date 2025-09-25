@@ -1,82 +1,102 @@
-const nodemailer = require('nodemailer');
+// api/contact.js
+const nodemailer = require("nodemailer");
 
-module.exports = async (req, res) => {
-	// CORS - adjust origin as needed for security
-	const origin = req.headers.origin || '*';
-	res.setHeader('Access-Control-Allow-Origin', origin);
-	res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-	res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-	res.setHeader('Access-Control-Allow-Credentials', 'true');
+const sendError = (res, status, message) =>
+	res.status(status).json({ error: message });
 
-	if (req.method === 'OPTIONS') {
+function validateEmail(email) {
+	return typeof email === "string" && /.+@.+\..+/.test(email);
+}
+
+module.exports = async function handler(req, res) {
+	// CORS
+	res.setHeader("Access-Control-Allow-Origin", "*");
+	res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+	res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+	if (req.method === "OPTIONS") {
 		return res.status(204).end();
 	}
 
-	if (req.method !== 'POST') {
-		res.setHeader('Allow', 'POST, OPTIONS');
-		return res.status(405).json({ error: 'Method Not Allowed' });
+	if (req.method !== "POST") {
+		return sendError(res, 405, "Method Not Allowed");
+	}
+
+	let body = req.body;
+	// Some serverless platforms may provide raw string body
+	if (!body || Object.keys(body).length === 0) {
+		try {
+			body = JSON.parse(req.rawBody || req.body || "{}");
+		} catch (err) {
+			// ignore, will validate below
+		}
+	}
+
+	const name = (body && body.name) ? String(body.name).trim() : "";
+	const company = body && body.company ? String(body.company).trim() : "";
+	const email = body && body.email ? String(body.email).trim() : "";
+	const service = body && body.service ? String(body.service).trim() : "";
+	const message = body && body.message ? String(body.message).trim() : "";
+
+	if (!name) return sendError(res, 400, "Name is required");
+	if (!validateEmail(email)) return sendError(res, 400, "Valid email is required");
+	if (!service) return sendError(res, 400, "Service is required");
+	if (!message) return sendError(res, 400, "Message is required");
+
+	const smtpHost = process.env.SMTP_HOST;
+	const smtpPort = process.env.SMTP_PORT ? Number(process.env.SMTP_PORT) : undefined;
+	const smtpUser = process.env.SMTP_USER;
+	const smtpPass = process.env.SMTP_PASS;
+	const contactTo = process.env.CONTACT_TO || "business@felder-itsolutions.at";
+	const fromEmail = process.env.FROM_EMAIL || smtpUser || "no-reply@felder-itsolutions.at";
+
+	if (!smtpHost || !smtpPort || !smtpUser || !smtpPass) {
+		console.error("SMTP configuration missing");
+		return sendError(res, 500, "SMTP configuration not provided on server.");
 	}
 
 	try {
-		const { name, company, email, message, service } = req.body || {};
-
-		const smtpUser = process.env.SMTP_USER;
-		const smtpPass = process.env.SMTP_PASS;
-		const contactTo = process.env.CONTACT_TO || 'business@felder-itsolutions.at';
-		const fromEmail = process.env.FROM_EMAIL || smtpUser || 'no-reply@felder-itsolutions.at';
-
-		if (!smtpUser || !smtpPass) {
-			return res.status(500).json({ error: 'SMTP credentials not configured' });
-		}
-
-		// service should already be the final value (if frontend sent customService it was merged)
-		const serviceLabel = (service || 'Allgemeine Anfrage').toString();
-		const serviceHeading = serviceLabel.toUpperCase();
-
 		const transporter = nodemailer.createTransport({
-			host: 'smtp.world4you.com',
-			port: 587,
-			secure: false, // STARTTLS
-			requireTLS: true,
-			auth: { user: smtpUser, pass: smtpPass },
+			host: smtpHost,
+			port: smtpPort,
+			secure: smtpPort === 465,
+			auth: {
+				user: smtpUser,
+				pass: smtpPass,
+			},
 		});
 
-		const subject = serviceLabel; // E-Mail Betreff = ausgewählte Dienstleistung
-		const text = [
-			`Dienstleistung: ${serviceLabel}`,
-			`Name: ${name || '-'}`,
-			`Firma: ${company || '-'}`,
-			`E-Mail: ${email || '-'}`,
-			'',
-			'Mitteilung:',
-			message || '',
-		].join('\n');
+		const subject = `Neue Kontaktanfrage: ${service}`;
+		const text = `Dienstleistung: ${service}\nName: ${name}\nUnternehmen: ${company || "-"}\nE-Mail: ${email}\n\nNachricht:\n${message}`;
 
-		const html = `
-  <small>Neue Kontaktanfrage</small>
-  <h1 style="text-transform:uppercase">${serviceHeading}</h1>
-  <p><strong>Name:</strong> ${name || '-'}</p>
-  <p><strong>Firma:</strong> ${company || '-'}</p>
-  <p><strong>E-Mail:</strong> ${email || '-'}</p>
-  <hr />
-  <p>${(message || '').replace(/\n/g, '<br/>')}</p>
-`;
+		const html = `<p><strong>Dienstleistung:</strong> ${escapeHtml(service)}</p>
+                 <p><strong>Name:</strong> ${escapeHtml(name)}</p>
+                 <p><strong>Unternehmen:</strong> ${escapeHtml(company || "-")}</p>
+                 <p><strong>E-Mail:</strong> ${escapeHtml(email)}</p>
+                 <h3>Nachricht</h3>
+                 <p>${escapeHtml(message).replace(/\n/g, "<br/>")}</p>`;
 
-		const mailOptions = {
-			from: `${serviceLabel} <${fromEmail}>`,
+		await transporter.sendMail({
+			from: fromEmail,
 			to: contactTo,
 			subject,
 			text,
 			html,
-			replyTo: email || undefined,
-			envelope: { from: fromEmail, to: contactTo },
-		};
-
-		await transporter.sendMail(mailOptions);
+		});
 
 		return res.status(200).json({ success: true });
 	} catch (err) {
-		console.error(err);
-		return res.status(500).json({ error: err && err.message ? err.message : 'Unknown error' });
+		console.error("Failed to send contact email:", err);
+		return sendError(res, 500, "Failed to send email.");
 	}
 };
+
+function escapeHtml(str) {
+	if (typeof str !== "string") return "";
+	return str
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;")
+		.replace(/'/g, "&#039;");
+}
